@@ -1,458 +1,555 @@
 # -*- coding: utf-8 -*-
 
+import html
 import logging
 import os
 import re
+import uuid
 from typing import Optional
 
 from telegram import (
-    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
-    KeyboardButton,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
+    Update,
 )
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import (
     Application,
-    CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
-    ConversationHandler,
+    CommandHandler,
     ContextTypes,
-    filters,
+    ConversationHandler,
+    MessageHandler,
     PicklePersistence,
+    filters,
 )
 
 # ================= НАСТРОЙКИ =================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# ID чата модерации теперь берём из окружения, а не хардкодим.
-DRIVER_REG_CHAT_ID = int(os.getenv("DRIVER_REG_CHAT_ID", "0"))
-
-# Таймаут диалога регистрации (в секундах). Если пользователь бросил
-# заполнение анкеты, состояние сбросится само через 30 минут.
-CONV_TIMEOUT = 30 * 60
+# Основное имя переменной — ORDERS_CHAT_ID.
+# DRIVER_REG_CHAT_ID оставлен как временный запасной вариант,
+# чтобы уже настроенный Railway продолжил работать без остановки.
+ORDERS_CHAT_ID = int(
+    os.getenv("ORDERS_CHAT_ID")
+    or os.getenv("DRIVER_REG_CHAT_ID", "0")
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
-
 logger = logging.getLogger(__name__)
 
-# ================= СОСТОЯНИЯ =================
+# ================= СОСТОЯНИЯ ЗАКАЗА =================
 
-REG_NAME, REG_PHONE, REG_CAR, REG_DOCS, REG_CONFIRM = range(5)
+(
+    ORDER_NAME,
+    ORDER_PHONE,
+    ORDER_FROM,
+    ORDER_TO,
+    ORDER_TIME,
+    ORDER_CLASS,
+    ORDER_COMMENT,
+    ORDER_CONFIRM,
+) = range(8)
+
+# ================= КЛАВИАТУРЫ =================
+
+MAIN_KB = ReplyKeyboardMarkup(
+    [["🚖 Заказать поездку"]],
+    resize_keyboard=True,
+)
+
+PHONE_KB = ReplyKeyboardMarkup(
+    [[KeyboardButton("📱 Отправить мой номер", request_contact=True)]],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+CLASS_KB = ReplyKeyboardMarkup(
+    [
+        ["Business", "First"],
+        ["Минивэн", "Неважно"],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+COMMENT_KB = ReplyKeyboardMarkup(
+    [["Пропустить"]],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
 
 # ================= УТИЛИТЫ =================
 
+
 def normalize_phone(text: str) -> Optional[str]:
+    """Приводит номер к виду +XXXXXXXXXX и отсеивает явно неверные значения."""
     digits = re.sub(r"\D", "", text or "")
 
     if digits.startswith("8") and len(digits) == 11:
         digits = "7" + digits[1:]
-
-    if len(digits) == 10:
+    elif len(digits) == 10:
         digits = "7" + digits
 
-    if len(digits) != 11 or not digits.startswith("7"):
+    if not 10 <= len(digits) <= 15:
         return None
 
-    # Отсекаем совсем нереальные номера вида +70000000000
-    if digits == "7" + "0" * 10:
+    if len(set(digits)) == 1:
         return None
 
     return "+" + digits
 
 
-# ================= START =================
+def clean_text(text: str, max_length: int = 300) -> str:
+    """Убирает лишние пробелы и ограничивает длину пользовательского текста."""
+    value = " ".join((text or "").strip().split())
+    return value[:max_length]
+
+
+def order_summary(order: dict) -> str:
+    return (
+        "Проверьте заказ:\n\n"
+        f"Имя: {order['name']}\n"
+        f"Телефон: {order['phone']}\n"
+        f"Откуда: {order['from']}\n"
+        f"Куда: {order['to']}\n"
+        f"Когда: {order['time']}\n"
+        f"Класс: {order['car_class']}\n"
+        f"Комментарий: {order['comment']}"
+    )
+
+
+def group_order_text(order_id: str, order: dict) -> str:
+    return (
+        f"🚖 НОВЫЙ ЗАКАЗ №{html.escape(order_id)}\n\n"
+        f"👤 Клиент: {html.escape(order['name'])}\n"
+        f"📱 Телефон: {html.escape(order['phone'])}\n"
+        f"📍 Откуда: {html.escape(order['from'])}\n"
+        f"🏁 Куда: {html.escape(order['to'])}\n"
+        f"🕒 Когда: {html.escape(order['time'])}\n"
+        f"🚘 Класс: {html.escape(order['car_class'])}\n"
+        f"💬 Комментарий: {html.escape(order['comment'])}\n\n"
+        "Статус: 🟢 свободен"
+    )
+
+
+def driver_display_name(user) -> str:
+    full_name = clean_text(user.full_name, 100) or f"ID {user.id}"
+    if user.username:
+        return f"{full_name} (@{user.username})"
+    return full_name
+
+
+# ================= ОБЩИЕ КОМАНДЫ =================
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = ReplyKeyboardMarkup(
-        [["👨‍✈️ Стать водителем"]],
-        resize_keyboard=True
+    if update.effective_chat.type != "private":
+        await update.effective_message.reply_text(
+            "Заказ оформляется в личном чате с ботом.\n"
+            "Для получения ID этого чата используйте /chatid."
+        )
+        return
+
+    context.user_data.pop("order", None)
+    await update.effective_message.reply_text(
+        "🚖 VIP Taxi\n\nНажмите кнопку, чтобы оформить поездку:",
+        reply_markup=MAIN_KB,
     )
 
-    await update.message.reply_text(
-        "🚖 VIP Taxi\n\nВыберите действие:",
-        reply_markup=kb
+
+async def chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        f"ID этого чата: {update.effective_chat.id}"
     )
 
-
-# ================= ОТМЕНА =================
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("reg", None)
-
-    await update.message.reply_text(
-        "Регистрация отменена.",
-        reply_markup=ReplyKeyboardRemove()
+    context.user_data.pop("order", None)
+    await update.effective_message.reply_text(
+        "Оформление заказа отменено.",
+        reply_markup=MAIN_KB,
     )
-
     return ConversationHandler.END
 
 
-async def conv_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Срабатывает, если пользователь ничего не отвечает CONV_TIMEOUT секунд."""
-    context.user_data.pop("reg", None)
+# ================= СОЗДАНИЕ ЗАКАЗА =================
 
-    if update and update.effective_chat:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="Время регистрации истекло. Начните заново: /start",
-            reply_markup=ReplyKeyboardRemove()
+
+async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        await update.effective_message.reply_text(
+            "Откройте личный чат с ботом и отправьте /start."
         )
+        return ConversationHandler.END
 
-    return ConversationHandler.END
-
-
-# ================= РЕГИСТРАЦИЯ =================
-
-async def reg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Защита от дублирующих заявок: если уже есть незавершённая регистрация,
-    # просто продолжаем её, а не затираем прогресс.
-    if "reg" not in context.user_data:
-        context.user_data["reg"] = {"photos": []}
-
-    await update.message.reply_text(
-        "Введите ФИО полностью:",
-        reply_markup=ReplyKeyboardRemove()
+    context.user_data["order"] = {}
+    await update.effective_message.reply_text(
+        "Как к вам обращаться?",
+        reply_markup=ReplyKeyboardRemove(),
     )
+    return ORDER_NAME
 
-    return REG_NAME
 
+async def order_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = clean_text(update.effective_message.text, 100)
+    if len(name) < 2:
+        await update.effective_message.reply_text("Введите имя ещё раз.")
+        return ORDER_NAME
 
-async def reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
-
-    if len(name.split()) < 2:
-        await update.message.reply_text(
-            "Введите ФИО полностью. Например: Иванов Иван Иванович"
-        )
-        return REG_NAME
-
-    context.user_data["reg"]["name"] = name
-
-    kb = ReplyKeyboardMarkup(
-        [[KeyboardButton("📱 Отправить номер", request_contact=True)]],
-        resize_keyboard=True
+    context.user_data["order"]["name"] = name
+    await update.effective_message.reply_text(
+        "Отправьте номер телефона кнопкой ниже или введите его вручную:",
+        reply_markup=PHONE_KB,
     )
-
-    await update.message.reply_text(
-        "Отправьте номер телефона кнопкой ниже или введите вручную:",
-        reply_markup=kb
-    )
-
-    return REG_PHONE
+    return ORDER_PHONE
 
 
-async def reg_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.contact:
-        phone = update.message.contact.phone_number
+async def order_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+
+    if message.contact:
+        if message.contact.user_id and message.contact.user_id != update.effective_user.id:
+            await message.reply_text("Отправьте именно свой номер телефона.")
+            return ORDER_PHONE
+        raw_phone = message.contact.phone_number
     else:
-        phone = update.message.text
+        raw_phone = message.text
 
-    phone = normalize_phone(phone)
-
+    phone = normalize_phone(raw_phone)
     if not phone:
-        await update.message.reply_text(
-            "Неверный номер. Введите российский номер в формате +7XXXXXXXXXX."
+        await message.reply_text(
+            "Не удалось распознать номер. Пример: +7 999 123-45-67"
         )
-        return REG_PHONE
+        return ORDER_PHONE
 
-    context.user_data["reg"]["phone"] = phone
+    context.user_data["order"]["phone"] = phone
+    await message.reply_text(
+        "Откуда вас забрать?\nНапишите адрес или название места:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ORDER_FROM
 
-    await update.message.reply_text(
-        "Введите авто: марка, модель, год, госномер.\n\n"
-        "Например: Mercedes-Benz S-Class W222, 2019, А123АА777",
-        reply_markup=ReplyKeyboardRemove()
+
+async def order_from(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pickup = clean_text(update.effective_message.text)
+    if len(pickup) < 3:
+        await update.effective_message.reply_text("Укажите место подачи подробнее.")
+        return ORDER_FROM
+
+    context.user_data["order"]["from"] = pickup
+    await update.effective_message.reply_text("Куда нужно ехать?")
+    return ORDER_TO
+
+
+async def order_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    destination = clean_text(update.effective_message.text)
+    if len(destination) < 3:
+        await update.effective_message.reply_text("Укажите пункт назначения подробнее.")
+        return ORDER_TO
+
+    context.user_data["order"]["to"] = destination
+    await update.effective_message.reply_text(
+        "Когда нужна машина?\n"
+        "Например: сейчас, сегодня в 19:30 или 10 июля в 08:00"
+    )
+    return ORDER_TIME
+
+
+async def order_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    when = clean_text(update.effective_message.text, 100)
+    if len(when) < 3:
+        await update.effective_message.reply_text("Укажите дату и время подробнее.")
+        return ORDER_TIME
+
+    context.user_data["order"]["time"] = when
+    await update.effective_message.reply_text(
+        "Выберите класс автомобиля:",
+        reply_markup=CLASS_KB,
+    )
+    return ORDER_CLASS
+
+
+async def order_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    car_class = clean_text(update.effective_message.text, 50)
+    allowed = {"Business", "First", "Минивэн", "Неважно"}
+
+    if car_class not in allowed:
+        await update.effective_message.reply_text(
+            "Выберите один из вариантов на клавиатуре.",
+            reply_markup=CLASS_KB,
+        )
+        return ORDER_CLASS
+
+    context.user_data["order"]["car_class"] = car_class
+    await update.effective_message.reply_text(
+        "Добавьте комментарий к заказу: номер рейса, детское кресло, количество пассажиров и т. п.\n\n"
+        "Либо нажмите «Пропустить».",
+        reply_markup=COMMENT_KB,
+    )
+    return ORDER_COMMENT
+
+
+async def order_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    comment = clean_text(update.effective_message.text)
+    if comment.lower() == "пропустить":
+        comment = "—"
+    elif not comment:
+        await update.effective_message.reply_text("Введите комментарий или нажмите «Пропустить».")
+        return ORDER_COMMENT
+
+    order = context.user_data["order"]
+    order["comment"] = comment
+
+    kb = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ Отправить заказ", callback_data="order_send"),
+            InlineKeyboardButton("❌ Отмена", callback_data="order_cancel"),
+        ]]
     )
 
-    return REG_CAR
-
-
-async def reg_car(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    car = update.message.text.strip()
-
-    if len(car) < 8:
-        await update.message.reply_text(
-            "Введите авто подробнее: марка, модель, год, госномер."
-        )
-        return REG_CAR
-
-    context.user_data["reg"]["car"] = car
-
-    kb = ReplyKeyboardMarkup(
-        [["Готово"]],
-        resize_keyboard=True
+    await update.effective_message.reply_text(
+        order_summary(order) + "\n\nОтправить заказ водителям?",
+        reply_markup=kb,
     )
-
-    await update.message.reply_text(
-        "Отправьте фото документов и авто.\n\n"
-        "Например:\n"
-        "— водительское удостоверение\n"
-        "— СТС\n"
-        "— фото автомобиля\n\n"
-        "Когда закончите, нажмите «Готово».",
-        reply_markup=kb
-    )
-
-    return REG_DOCS
+    return ORDER_CONFIRM
 
 
-async def reg_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reg = context.user_data.get("reg")
-
-    if not reg:
-        await update.message.reply_text("Ошибка регистрации. Начните заново: /start")
-        return ConversationHandler.END
-
-    if update.message.text and update.message.text.lower() == "готово":
-        if len(reg["photos"]) == 0:
-            await update.message.reply_text(
-                "Нужно отправить хотя бы одно фото документов или автомобиля."
-            )
-            return REG_DOCS
-
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ Отправить", callback_data="send"),
-                InlineKeyboardButton("❌ Отмена", callback_data="cancel")
-            ]
-        ])
-
-        await update.message.reply_text(
-            f"Проверьте заявку:\n\n"
-            f"ФИО: {reg['name']}\n"
-            f"Телефон: {reg['phone']}\n"
-            f"Авто: {reg['car']}\n"
-            f"Фото: {len(reg['photos'])}\n\n"
-            f"Отправить заявку?",
-            reply_markup=kb
-        )
-
-        return REG_CONFIRM
-
-    if update.message.photo:
-        # Ограничиваем количество фото, чтобы не заспамить чат модерации.
-        if len(reg["photos"]) >= 10:
-            await update.message.reply_text(
-                "Достигнут лимит в 10 фото. Нажмите «Готово», чтобы продолжить."
-            )
-            return REG_DOCS
-
-        file_id = update.message.photo[-1].file_id
-        reg["photos"].append(file_id)
-
-        await update.message.reply_text(
-            f"Фото добавлено. Всего фото: {len(reg['photos'])}"
-        )
-
-        return REG_DOCS
-
-    await update.message.reply_text(
-        "Отправьте фото или нажмите «Готово»."
-    )
-
-    return REG_DOCS
-
-
-async def reg_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "cancel":
-        context.user_data.pop("reg", None)
-        await query.edit_message_text("Заявка отменена.")
+    if query.data == "order_cancel":
+        context.user_data.pop("order", None)
+        await query.edit_message_text("Заказ отменён.")
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="Можно оформить новый заказ:",
+            reply_markup=MAIN_KB,
+        )
         return ConversationHandler.END
 
-    reg = context.user_data.get("reg")
-
-    if not reg:
-        await query.edit_message_text("Ошибка: данные заявки не найдены.")
+    order = context.user_data.get("order")
+    if not order:
+        await query.edit_message_text("Данные заказа не найдены. Начните заново: /start")
         return ConversationHandler.END
 
-    user = query.from_user
+    order_id = uuid.uuid4().hex[:8].upper()
+    order_record = {
+        **order,
+        "client_id": query.from_user.id,
+        "client_username": query.from_user.username or "",
+        "status": "open",
+        "driver_id": None,
+        "driver_name": None,
+    }
 
-    # ИСПРАВЛЕНО: раньше тернарный оператор относился ко всей f-строке text,
-    # а не только к последней строке — при отсутствии username вся заявка
-    # (ФИО, телефон, авто, фото) исчезала из сообщения модератору.
-    username_line = f"Username: @{user.username}" if user.username else "Username: —"
-
-    text = (
-        f"🚖 Новая заявка водителя\n\n"
-        f"ФИО: {reg['name']}\n"
-        f"Телефон: {reg['phone']}\n"
-        f"Авто: {reg['car']}\n"
-        f"Фото: {len(reg['photos'])}\n\n"
-        f"Telegram ID: {user.id}\n"
-        f"{username_line}"
+    take_kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ Взять заказ", callback_data=f"take_{order_id}")]]
     )
 
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Одобрить", callback_data=f"ok_{user.id}"),
-            InlineKeyboardButton("❌ Отклонить", callback_data=f"no_{user.id}")
-        ]
-    ])
-
     try:
-        await context.bot.send_message(
-            chat_id=DRIVER_REG_CHAT_ID,
-            text=text,
-            reply_markup=kb
+        sent = await context.bot.send_message(
+            chat_id=ORDERS_CHAT_ID,
+            text=group_order_text(order_id, order_record),
+            parse_mode="HTML",
+            reply_markup=take_kb,
         )
-
-        for photo_id in reg["photos"]:
-            await context.bot.send_photo(
-                chat_id=DRIVER_REG_CHAT_ID,
-                photo=photo_id
-            )
     except TelegramError:
-        logger.exception("Не удалось отправить заявку в чат модерации")
+        logger.exception("Не удалось отправить заказ в группу %s", ORDERS_CHAT_ID)
         await query.edit_message_text(
-            "Не удалось отправить заявку. Попробуйте позже или свяжитесь с поддержкой."
+            "Не удалось передать заказ водителям. Попробуйте ещё раз позже."
         )
         return ConversationHandler.END
 
-    context.user_data.pop("reg", None)
+    order_record["group_message_id"] = sent.message_id
+    context.bot_data.setdefault("orders", {})[order_id] = order_record
 
+    context.user_data.pop("order", None)
     await query.edit_message_text(
-        "Заявка отправлена. Ожидайте решения."
+        f"✅ Заказ №{order_id} отправлен водителям.\n"
+        "Мы сообщим, когда водитель возьмёт заказ."
+    )
+    await context.bot.send_message(
+        chat_id=query.from_user.id,
+        text="Для нового заказа нажмите кнопку ниже.",
+        reply_markup=MAIN_KB,
     )
 
     return ConversationHandler.END
 
 
-# ================= МОДЕРАЦИЯ =================
+# ================= ВОДИТЕЛЬ БЕРЁТ ЗАКАЗ =================
 
-async def moderation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def take_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
-    if query.message.chat_id != DRIVER_REG_CHAT_ID:
-        await query.answer("Недоступно", show_alert=True)
+    if not query.message or query.message.chat_id != ORDERS_CHAT_ID:
+        await query.answer("Эта кнопка недоступна.", show_alert=True)
         return
 
-    # Проверяем, что нажавший кнопку — админ чата модерации,
-    # а не любой участник группы.
-    member = await context.bot.get_chat_member(DRIVER_REG_CHAT_ID, query.from_user.id)
-    if member.status not in ("administrator", "creator"):
-        await query.answer("Только для администраторов", show_alert=True)
+    order_id = query.data.removeprefix("take_")
+    orders = context.bot_data.setdefault("orders", {})
+    order = orders.get(order_id)
+
+    if not order:
+        await query.answer(
+            "Данные заказа не найдены. Возможно, бот перезапускался.",
+            show_alert=True,
+        )
         return
 
-    data = query.data
-
-    try:
-        action, user_id_raw = data.split("_")
-        user_id = int(user_id_raw)
-    except Exception:
-        await query.edit_message_text("Ошибка обработки заявки.")
-        return
-
-    if action == "ok":
-        result_text = "Заявка одобрена ✅"
-        user_text = "Ваша заявка одобрена ✅"
-    elif action == "no":
-        result_text = "Заявка отклонена ❌"
-        user_text = "Ваша заявка отклонена ❌"
-    else:
+    if order.get("status") != "open":
+        await query.answer("Этот заказ уже взят другим водителем.", show_alert=True)
         return
 
     try:
-        await context.bot.send_message(chat_id=user_id, text=user_text)
-    except Forbidden:
-        # Пользователь заблокировал бота — модератор всё равно должен
-        # увидеть, что решение принято.
-        logger.warning("Не удалось уведомить пользователя %s: бот заблокирован", user_id)
-        result_text += "\n(не удалось уведомить пользователя — бот заблокирован)"
+        member = await context.bot.get_chat_member(ORDERS_CHAT_ID, query.from_user.id)
     except TelegramError:
-        logger.exception("Ошибка уведомления пользователя %s", user_id)
-        result_text += "\n(ошибка при уведомлении пользователя)"
+        logger.exception("Не удалось проверить участника группы")
+        await query.answer("Не удалось проверить доступ. Попробуйте ещё раз.", show_alert=True)
+        return
 
-    await query.edit_message_text(result_text)
+    if member.status not in {"member", "administrator", "creator", "restricted"}:
+        await query.answer("Только для участников группы водителей.", show_alert=True)
+        return
+
+    # Обновления обрабатываются последовательно: первый водитель меняет статус,
+    # а все последующие получают сообщение, что заказ уже занят.
+    driver = query.from_user
+    driver_name = driver_display_name(driver)
+    order["status"] = "taken"
+    order["driver_id"] = driver.id
+    order["driver_name"] = driver_name
+
+    accepted_text = (
+        group_order_text(order_id, order).replace(
+            "Статус: 🟢 свободен",
+            f"Статус: 🔴 заказ взят\n🚘 Водитель: {html.escape(driver_name)}",
+        )
+    )
+
+    try:
+        await query.edit_message_text(
+            accepted_text,
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+    except TelegramError:
+        # Если редактирование не удалось, возвращаем заказ в свободное состояние.
+        order["status"] = "open"
+        order["driver_id"] = None
+        order["driver_name"] = None
+        logger.exception("Не удалось закрепить заказ %s", order_id)
+        await query.answer("Не удалось взять заказ. Попробуйте ещё раз.", show_alert=True)
+        return
+
+    await query.answer("Заказ закреплён за вами ✅", show_alert=True)
+
+    client_notice = (
+        f"🚘 Водитель взял заказ №{order_id}.\n\n"
+        f"Водитель: {driver_name}\n"
+        "Водитель свяжется с вами по указанному номеру."
+    )
+
+    try:
+        await context.bot.send_message(order["client_id"], client_notice)
+    except Forbidden:
+        logger.warning("Клиент %s заблокировал бота", order["client_id"])
+    except TelegramError:
+        logger.exception("Не удалось уведомить клиента по заказу %s", order_id)
+
+    driver_notice = (
+        f"✅ Вы взяли заказ №{order_id}\n\n"
+        f"Клиент: {order['name']}\n"
+        f"Телефон: {order['phone']}\n"
+        f"Откуда: {order['from']}\n"
+        f"Куда: {order['to']}\n"
+        f"Когда: {order['time']}\n"
+        f"Класс: {order['car_class']}\n"
+        f"Комментарий: {order['comment']}"
+    )
+
+    try:
+        await context.bot.send_message(driver.id, driver_notice)
+    except Forbidden:
+        logger.info(
+            "Водитель %s не запускал бота в личном чате; детали остались в группе",
+            driver.id,
+        )
+    except TelegramError:
+        logger.exception("Не удалось отправить детали водителю %s", driver.id)
 
 
-# ================= ОБРАБОТКА ОШИБОК =================
+# ================= ОШИБКИ =================
+
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Необработанное исключение", exc_info=context.error)
 
 
-# ================= MAIN =================
+# ================= ЗАПУСК =================
+
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("Укажи переменную окружения BOT_TOKEN")
+        raise RuntimeError("Укажите переменную окружения BOT_TOKEN")
 
-    if not DRIVER_REG_CHAT_ID:
-        raise RuntimeError("Укажи переменную окружения DRIVER_REG_CHAT_ID")
+    if not ORDERS_CHAT_ID:
+        raise RuntimeError("Укажите переменную окружения ORDERS_CHAT_ID")
 
-    # Сохраняем user_data на диск, чтобы регистрация не терялась
-    # при перезапуске бота.
     persistence = PicklePersistence(filepath="bot_state.pickle")
 
     app = (
         Application.builder()
         .token(BOT_TOKEN)
         .persistence(persistence)
+        .concurrent_updates(False)
         .build()
     )
 
-    conv = ConversationHandler(
+    order_conversation = ConversationHandler(
         entry_points=[
-            CommandHandler("reg_driver", reg_start),
-            MessageHandler(
-                filters.Regex("^👨‍✈️ Стать водителем$"),
-                reg_start
-            ),
+            CommandHandler("order", order_start),
+            MessageHandler(filters.Regex(r"^🚖 Заказать поездку$"), order_start),
         ],
         states={
-            REG_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, reg_name)
+            ORDER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_name)],
+            ORDER_PHONE: [
+                MessageHandler(filters.CONTACT, order_phone),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, order_phone),
             ],
-            REG_PHONE: [
-                MessageHandler(filters.CONTACT, reg_phone),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, reg_phone),
-            ],
-            REG_CAR: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, reg_car)
-            ],
-            REG_DOCS: [
-                MessageHandler(filters.PHOTO, reg_docs),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, reg_docs),
-            ],
-            REG_CONFIRM: [
-                CallbackQueryHandler(reg_confirm, pattern="^(send|cancel)$")
-            ],
-            ConversationHandler.TIMEOUT: [
-                MessageHandler(filters.ALL, conv_timeout),
-                CallbackQueryHandler(conv_timeout),
+            ORDER_FROM: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_from)],
+            ORDER_TO: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_to)],
+            ORDER_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_time)],
+            ORDER_CLASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_class)],
+            ORDER_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_comment)],
+            ORDER_CONFIRM: [
+                CallbackQueryHandler(order_confirm, pattern=r"^order_(send|cancel)$")
             ],
         },
-        fallbacks=[
-            CommandHandler("cancel", cancel)
-        ],
-        conversation_timeout=CONV_TIMEOUT,
-        name="driver_registration",
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+        name="client_order",
         persistent=True,
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv)
-
-    app.add_handler(
-        CallbackQueryHandler(moderation, pattern="^(ok|no)_")
-    )
-
+    app.add_handler(CommandHandler("chatid", chat_id))
+    app.add_handler(order_conversation)
+    app.add_handler(CallbackQueryHandler(take_order, pattern=r"^take_[A-F0-9]{8}$"))
     app.add_error_handler(error_handler)
 
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
     main()
-
