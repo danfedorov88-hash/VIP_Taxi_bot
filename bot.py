@@ -93,6 +93,13 @@ LOCATION_KB = ReplyKeyboardMarkup(
     one_time_keyboard=True,
 )
 
+TIME_KB = ReplyKeyboardMarkup(
+    [["Сейчас"], ["Указать дату и время"]],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+
 CLASS_KB = ReplyKeyboardMarkup(
     [["Business", "First"], ["Минивэн", "Неважно"]],
     resize_keyboard=True,
@@ -153,6 +160,18 @@ def esc(value: object) -> str:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def now_moscow() -> datetime:
+    return datetime.now(timezone(timedelta(hours=3)))
+
+
+def format_dt(value: datetime) -> str:
+    return value.strftime("%d.%m.%Y %H:%M")
+
+
+def current_time_label() -> str:
+    return f"Сейчас — {format_dt(now_moscow())}"
 
 
 def yandex_link(latitude: float, longitude: float) -> str:
@@ -240,6 +259,7 @@ def order_public_text(order_id: str, order: dict) -> str:
         f"📍 <b>Откуда:</b> {esc(order['from'])}\n"
         f"🏁 <b>Куда:</b> {esc(order['to'])}\n"
         f"🕒 <b>Когда:</b> {esc(order['time'])}\n"
+        f"🗓 <b>Создан:</b> {esc(order.get('created_at_display', '—'))}\n"
         f"🚘 <b>Класс:</b> {esc(order['car_class'])}\n"
         f"💬 <b>Комментарий:</b> {esc(order['comment'])}\n\n"
         "Личные данные клиента скрыты."
@@ -247,13 +267,16 @@ def order_public_text(order_id: str, order: dict) -> str:
 
 
 def driver_private_order_text(order_id: str, order: dict) -> str:
+    arrived_line = "\n📍 <b>Статус:</b> водитель на месте" if order.get("arrived_at") else ""
     return (
         f"✅ <b>Вы взяли заказ №{esc(order_id)}</b>\n\n"
         f"📍 <b>Откуда:</b> {esc(order['from'])}\n"
         f"🏁 <b>Куда:</b> {esc(order['to'])}\n"
         f"🕒 <b>Когда:</b> {esc(order['time'])}\n"
+        f"🗓 <b>Создан:</b> {esc(order.get('created_at_display', '—'))}\n"
         f"🚘 <b>Класс:</b> {esc(order['car_class'])}\n"
-        f"💬 <b>Комментарий:</b> {esc(order['comment'])}\n\n"
+        f"💬 <b>Комментарий:</b> {esc(order['comment'])}"
+        f"{arrived_line}\n\n"
         "Пишите клиенту прямо в этом чате. Контакты сторон скрыты."
     )
 
@@ -265,6 +288,7 @@ def order_summary(order: dict) -> str:
         f"Откуда: {order['from']}\n"
         f"Куда: {order['to']}\n"
         f"Когда: {order['time']}\n"
+        f"Создан: {order.get('created_at_display', '—')}\n"
         f"Класс: {order['car_class']}\n"
         f"Комментарий: {order['comment']}"
     )
@@ -469,8 +493,8 @@ async def order_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_and_track(
         context,
         update.effective_message,
-        "Когда нужна машина?\n"
-        "Например: сейчас, сегодня в 19:30 или 10 июля в 08:00",
+        "Когда нужна машина?",
+        reply_markup=TIME_KB,
     )
     return ORDER_TIME
 
@@ -478,6 +502,17 @@ async def order_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def order_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_incoming_draft(context, update.effective_message)
     when = clean_text(update.effective_message.text, 100)
+
+    if when.lower() == "сейчас":
+        when = current_time_label()
+    elif when == "Указать дату и время":
+        await reply_and_track(
+            context,
+            update.effective_message,
+            "Напишите дату и время. Например: сегодня в 19:30 или 10 июля в 08:00",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ORDER_TIME
 
     if len(when) < 3:
         await reply_and_track(
@@ -1155,7 +1190,10 @@ async def take_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     finish_kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✅ Завершить заказ", callback_data=f"finish_{order_id}")]]
+        [
+            [InlineKeyboardButton("📍 Я на месте", callback_data=f"arrived_{order_id}")],
+            [InlineKeyboardButton("✅ Завершить заказ", callback_data=f"finish_{order_id}")],
+        ]
     )
 
     try:
@@ -1188,14 +1226,65 @@ async def take_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.exception("Не удалось вернуть заказ в группу")
         return
 
+    client_kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📸 Запросить фото машины", callback_data=f"request_photo_{order_id}")]]
+    )
+
     client_message = await context.bot.send_message(
         order["client_id"],
         f"🚘 Водитель принял заказ №{order_id}.\n\n"
         "Пишите сообщения в этот чат — бот передаст их водителю. "
-        "Контакты сторон скрыты.",
-        reply_markup=ReplyKeyboardRemove(),
+        "Контакты сторон скрыты.\n\n"
+        "Можете запросить фото машины кнопкой ниже.",
+        reply_markup=client_kb,
     )
     add_tracked(order, client_message.chat_id, client_message.message_id)
+
+
+async def request_car_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_storage(context)
+    query = update.callback_query
+    order_id = query.data.removeprefix("request_photo_")
+    order = context.bot_data["orders"].get(order_id)
+
+    if not order:
+        await query.answer("Заказ уже закрыт.", show_alert=True)
+        return
+
+    if query.from_user.id != order.get("client_id"):
+        await query.answer("Запросить фото может только клиент этого заказа.", show_alert=True)
+        return
+
+    if order.get("status") != "taken" or not order.get("driver_id"):
+        await query.answer("Водитель ещё не назначен.", show_alert=True)
+        return
+
+    order["car_photo_requested_at"] = now_iso()
+
+    await query.answer("Запрос фото отправлен водителю ✅", show_alert=True)
+
+    try:
+        client_notice = await context.bot.send_message(
+            order["client_id"],
+            f"📸 Запрос фото машины по заказу №{order_id} отправлен водителю.",
+        )
+        add_tracked(order, client_notice.chat_id, client_notice.message_id)
+    except TelegramError:
+        logger.exception("Не удалось уведомить клиента о запросе фото %s", order_id)
+
+    try:
+        driver_notice = await context.bot.send_message(
+            order["driver_id"],
+            f"📸 Клиент запросил фото машины по заказу №{order_id}.\n\n"
+            "Отправьте фото автомобиля прямо в этот чат — бот передаст его клиенту. "
+            "Госномер и лица на фото лучше закрыть, если не хотите их показывать.",
+        )
+        add_tracked(order, driver_notice.chat_id, driver_notice.message_id)
+    except Forbidden:
+        await query.answer("Водитель не открыл личный чат с ботом.", show_alert=True)
+    except TelegramError:
+        logger.exception("Не удалось отправить водителю запрос фото %s", order_id)
+        await query.answer("Не удалось отправить запрос водителю.", show_alert=True)
 
 # ================= АНОНИМНАЯ ПЕРЕПИСКА =================
 
@@ -1236,7 +1325,8 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_tracked(order, warning.chat_id, warning.message_id)
         return
 
-    if message.text and contact_data_detected(message.text):
+    content_text = message.text or message.caption or ""
+    if content_text and contact_data_detected(content_text):
         try:
             await message.delete()
         except TelegramError:
@@ -1268,6 +1358,59 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Не удалось передать сообщение. Попробуйте ещё раз.",
         )
         add_tracked(order, error_message.chat_id, error_message.message_id)
+
+
+async def arrived_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_storage(context)
+    query = update.callback_query
+    order_id = query.data.removeprefix("arrived_")
+    order = context.bot_data["orders"].get(order_id)
+
+    if not order:
+        await query.answer("Заказ уже закрыт.", show_alert=True)
+        return
+
+    if query.from_user.id != order.get("driver_id"):
+        await query.answer("Отметку может поставить только назначенный водитель.", show_alert=True)
+        return
+
+    if order.get("status") != "taken":
+        await query.answer("Заказ уже не активен.", show_alert=True)
+        return
+
+    if order.get("arrived_at"):
+        await query.answer("Вы уже отметились на месте.", show_alert=True)
+        return
+
+    order["arrived_at"] = now_iso()
+    order["arrived_at_display"] = format_dt(now_moscow())
+
+    await query.answer("Клиенту отправлено: водитель на месте ✅", show_alert=True)
+
+    finish_only_kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ Завершить заказ", callback_data=f"finish_{order_id}")]]
+    )
+
+    try:
+        await query.edit_message_text(
+            driver_private_order_text(order_id, order),
+            parse_mode="HTML",
+            reply_markup=finish_only_kb,
+            disable_web_page_preview=False,
+        )
+    except TelegramError:
+        logger.exception("Не удалось обновить карточку заказа у водителя %s", order_id)
+
+    try:
+        msg = await context.bot.send_message(
+            order["client_id"],
+            f"📍 Водитель прибыл на место подачи по заказу №{order_id}.\n"
+            f"Время отметки: {order['arrived_at_display']}\n\n"
+            "Пишите в этот чат, если нужно уточнить точку встречи.",
+        )
+        add_tracked(order, msg.chat_id, msg.message_id)
+    except TelegramError:
+        logger.exception("Не удалось уведомить клиента о прибытии по заказу %s", order_id)
 
 
 async def finish_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1423,6 +1566,8 @@ def main():
     app.add_handler(CallbackQueryHandler(cancel_open_order, pattern=r"^cancel_open_[A-F0-9]{8}$"))
     app.add_handler(CallbackQueryHandler(moderate_driver, pattern=r"^(approve|reject)_[A-F0-9]{8}$"))
     app.add_handler(CallbackQueryHandler(take_order, pattern=r"^take_[A-F0-9]{8}$"))
+    app.add_handler(CallbackQueryHandler(arrived_order, pattern=r"^arrived_[A-F0-9]{8}$"))
+    app.add_handler(CallbackQueryHandler(request_car_photo, pattern=r"^request_photo_[A-F0-9]{8}$"))
     app.add_handler(CallbackQueryHandler(finish_order, pattern=r"^finish_[A-F0-9]{8}$"))
 
     app.add_handler(ChatJoinRequestHandler(handle_join_request))
