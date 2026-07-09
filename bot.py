@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import asyncio
 import html
 import logging
 import os
@@ -56,9 +57,11 @@ logger = logging.getLogger(__name__)
     ORDER_TO,
     ORDER_TIME,
     ORDER_CLASS,
+    ORDER_TARIFF,
+    ORDER_PRICE,
     ORDER_COMMENT,
     ORDER_CONFIRM,
-) = range(7)
+) = range(9)
 
 (
     REG_NAME,
@@ -95,6 +98,18 @@ LOCATION_KB = ReplyKeyboardMarkup(
 
 TIME_KB = ReplyKeyboardMarkup(
     [["Сейчас"], ["Указать дату и время"]],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+TARIFF_KB = ReplyKeyboardMarkup(
+    [["Разовая поездка"], ["Почасовая"], ["Аэропорт"], ["Бизнес-день"]],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+PRICE_KB = ReplyKeyboardMarkup(
+    [["По договоренности"]],
     resize_keyboard=True,
     one_time_keyboard=True,
 )
@@ -172,6 +187,99 @@ def format_dt(value: datetime) -> str:
 
 def current_time_label() -> str:
     return f"Сейчас — {format_dt(now_moscow())}"
+
+
+MONTHS_RU = {
+    "января": 1, "январь": 1,
+    "февраля": 2, "февраль": 2,
+    "марта": 3, "март": 3,
+    "апреля": 4, "апрель": 4,
+    "мая": 5, "май": 5,
+    "июня": 6, "июнь": 6,
+    "июля": 7, "июль": 7,
+    "августа": 8, "август": 8,
+    "сентября": 9, "сентябрь": 9,
+    "октября": 10, "октябрь": 10,
+    "ноября": 11, "ноябрь": 11,
+    "декабря": 12, "декабрь": 12,
+}
+
+
+def parse_order_time_input(text: str) -> tuple[str, str, str]:
+    """Возвращает display, iso, expire_iso. Заказ удаляется через 30 минут после времени подачи."""
+    raw = clean_text(text, 120)
+    low = raw.lower().replace(",", " ").replace(" в ", " ")
+    now = now_moscow()
+
+    if low == "сейчас":
+        scheduled = now
+        display = current_time_label()
+        expire = scheduled + timedelta(minutes=30)
+        return display, scheduled.isoformat(), expire.isoformat()
+
+    if low == "сегодня":
+        display = "Сегодня — уточнить время"
+        scheduled = now
+        expire = scheduled + timedelta(minutes=30)
+        return display, scheduled.isoformat(), expire.isoformat()
+
+    if low == "завтра":
+        d = now + timedelta(days=1)
+        scheduled = d.replace(hour=0, minute=0, second=0, microsecond=0)
+        display = scheduled.strftime("%d.%m.%Y — уточнить время")
+        expire = scheduled + timedelta(hours=23, minutes=59)
+        return display, scheduled.isoformat(), expire.isoformat()
+
+    time_match = re.search(r"(\d{1,2})[:.](\d{2})", low)
+    hour = int(time_match.group(1)) if time_match else 0
+    minute = int(time_match.group(2)) if time_match else 0
+    if hour > 23 or minute > 59:
+        raise ValueError("bad time")
+
+    date = None
+    if "сегодня" in low:
+        date = now.date()
+    elif "завтра" in low:
+        date = (now + timedelta(days=1)).date()
+    else:
+        m = re.search(r"(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?", low)
+        if m:
+            day, month = int(m.group(1)), int(m.group(2))
+            year = int(m.group(3)) if m.group(3) else now.year
+            if year < 100:
+                year += 2000
+            date = datetime(year, month, day, tzinfo=now.tzinfo).date()
+        else:
+            for month_word, month_num in MONTHS_RU.items():
+                m2 = re.search(rf"(\d{{1,2}})\s+{month_word}(?:\s+(\d{{4}}))?", low)
+                if m2:
+                    day = int(m2.group(1))
+                    year = int(m2.group(2)) if m2.group(2) else now.year
+                    date = datetime(year, month_num, day, tzinfo=now.tzinfo).date()
+                    break
+
+    if date is None:
+        if not time_match:
+            raise ValueError("no date time")
+        # Если клиент написал только 16:00 — считаем сегодняшним временем, если оно ещё не прошло, иначе завтра.
+        date = now.date()
+
+    scheduled = datetime(date.year, date.month, date.day, hour, minute, tzinfo=now.tzinfo)
+    if date == now.date() and time_match and scheduled < now:
+        scheduled = scheduled + timedelta(days=1)
+    if scheduled.date() < now.date():
+        scheduled = scheduled.replace(year=scheduled.year + 1)
+
+    display = format_dt(scheduled)
+    expire = scheduled + timedelta(minutes=30)
+    return display, scheduled.isoformat(), expire.isoformat()
+
+
+def parse_iso_dt(value: str) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
 
 
 def yandex_link(latitude: float, longitude: float) -> str:
@@ -259,15 +367,26 @@ def order_public_text(order_id: str, order: dict) -> str:
         f"📍 <b>Откуда:</b> {esc(order['from'])}\n"
         f"🏁 <b>Куда:</b> {esc(order['to'])}\n"
         f"🕒 <b>Когда:</b> {esc(order['time'])}\n"
+        f"⏳ <b>Удалится:</b> {esc(order.get('expires_at_display', '—'))}\n"
         f"🗓 <b>Создан:</b> {esc(order.get('created_at_display', '—'))}\n"
         f"🚘 <b>Класс:</b> {esc(order['car_class'])}\n"
+        f"💳 <b>Тариф:</b> {esc(order.get('tariff', '—'))}\n"
+        f"💰 <b>Цена:</b> {esc(order.get('price', '—'))}\n"
         f"💬 <b>Комментарий:</b> {esc(order['comment'])}\n\n"
         "Личные данные клиента скрыты."
     )
 
 
 def driver_private_order_text(order_id: str, order: dict) -> str:
-    arrived_line = "\n📍 <b>Статус:</b> водитель на месте" if order.get("arrived_at") else ""
+    status_lines = []
+    if order.get("arrived_at_display"):
+        status_lines.append(f"📍 <b>На месте:</b> {esc(order['arrived_at_display'])}")
+    if order.get("started_at_display"):
+        status_lines.append(f"▶️ <b>Начало поездки:</b> {esc(order['started_at_display'])}")
+    if order.get("completed_at_display"):
+        status_lines.append(f"🏁 <b>Окончание:</b> {esc(order['completed_at_display'])}")
+    status_block = "\n" + "\n".join(status_lines) if status_lines else ""
+
     return (
         f"✅ <b>Вы взяли заказ №{esc(order_id)}</b>\n\n"
         f"📍 <b>Откуда:</b> {esc(order['from'])}\n"
@@ -275,8 +394,10 @@ def driver_private_order_text(order_id: str, order: dict) -> str:
         f"🕒 <b>Когда:</b> {esc(order['time'])}\n"
         f"🗓 <b>Создан:</b> {esc(order.get('created_at_display', '—'))}\n"
         f"🚘 <b>Класс:</b> {esc(order['car_class'])}\n"
+        f"💳 <b>Тариф:</b> {esc(order.get('tariff', '—'))}\n"
+        f"💰 <b>Цена:</b> {esc(order.get('price', '—'))}\n"
         f"💬 <b>Комментарий:</b> {esc(order['comment'])}"
-        f"{arrived_line}\n\n"
+        f"{status_block}\n\n"
         "Пишите клиенту прямо в этом чате. Контакты сторон скрыты."
     )
 
@@ -290,6 +411,8 @@ def order_summary(order: dict) -> str:
         f"Когда: {order['time']}\n"
         f"Создан: {order.get('created_at_display', '—')}\n"
         f"Класс: {order['car_class']}\n"
+        f"Тариф: {order.get('tariff', '—')}\n"
+        f"Цена: {order.get('price', '—')}\n"
         f"Комментарий: {order['comment']}"
     )
 
@@ -410,7 +533,11 @@ async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
         context.bot_data["pending_by_client"].pop(str(user_id), None)
 
-    context.user_data["order"] = {"tracked_messages": []}
+    context.user_data["order"] = {
+        "tracked_messages": [],
+        "created_at": now_iso(),
+        "created_at_display": format_dt(now_moscow()),
+    }
     track_incoming_draft(context, update.effective_message)
 
     await reply_and_track(
@@ -501,28 +628,32 @@ async def order_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def order_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_incoming_draft(context, update.effective_message)
-    when = clean_text(update.effective_message.text, 100)
+    raw_when = clean_text(update.effective_message.text, 120)
 
-    if when.lower() == "сейчас":
-        when = current_time_label()
-    elif when == "Указать дату и время":
+    if raw_when == "Указать дату и время":
         await reply_and_track(
             context,
             update.effective_message,
-            "Напишите дату и время. Например: сегодня в 19:30 или 10 июля в 08:00",
+            "Напишите дату и время. Например: сегодня в 19:30, завтра в 16:00, 10 июля в 08:00 или 10.07.2026 08:00",
             reply_markup=ReplyKeyboardRemove(),
         )
         return ORDER_TIME
 
-    if len(when) < 3:
+    try:
+        display, scheduled_iso, expire_iso = parse_order_time_input(raw_when)
+    except Exception:
         await reply_and_track(
             context,
             update.effective_message,
-            "Укажите дату и время подробнее.",
+            "Не понял дату и время. Пример: сейчас, завтра в 16:00, 10 июля в 08:00 или 10.07.2026 08:00.",
         )
         return ORDER_TIME
 
-    context.user_data["order"]["time"] = when
+    context.user_data["order"]["time"] = display
+    context.user_data["order"]["scheduled_at"] = scheduled_iso
+    context.user_data["order"]["expires_at"] = expire_iso
+    context.user_data["order"]["expires_at_display"] = format_dt(parse_iso_dt(expire_iso)) if parse_iso_dt(expire_iso) else "—"
+
     await reply_and_track(
         context,
         update.effective_message,
@@ -546,6 +677,53 @@ async def order_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ORDER_CLASS
 
     context.user_data["order"]["car_class"] = car_class
+    await reply_and_track(
+        context,
+        update.effective_message,
+        "Выберите тариф:",
+        reply_markup=TARIFF_KB,
+    )
+    return ORDER_TARIFF
+
+
+async def order_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_incoming_draft(context, update.effective_message)
+    tariff = clean_text(update.effective_message.text, 80)
+    allowed = {"Разовая поездка", "Почасовая", "Аэропорт", "Бизнес-день"}
+
+    if tariff not in allowed:
+        await reply_and_track(
+            context,
+            update.effective_message,
+            "Выберите тариф на клавиатуре.",
+            reply_markup=TARIFF_KB,
+        )
+        return ORDER_TARIFF
+
+    context.user_data["order"]["tariff"] = tariff
+    await reply_and_track(
+        context,
+        update.effective_message,
+        "Укажите цену или бюджет. Например: 10000 ₽, 30000 ₽ день или нажмите «По договоренности».",
+        reply_markup=PRICE_KB,
+    )
+    return ORDER_PRICE
+
+
+async def order_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_incoming_draft(context, update.effective_message)
+    price = clean_text(update.effective_message.text, 80)
+
+    if not price:
+        await reply_and_track(
+            context,
+            update.effective_message,
+            "Укажите цену или нажмите «По договоренности».",
+            reply_markup=PRICE_KB,
+        )
+        return ORDER_PRICE
+
+    context.user_data["order"]["price"] = price
     await reply_and_track(
         context,
         update.effective_message,
@@ -620,6 +798,7 @@ async def order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "status": "open",
         "driver_id": None,
         "created_at": now_iso(),
+        "created_at_display": format_dt(now_moscow()),
     }
 
     take_kb = InlineKeyboardMarkup(
@@ -644,6 +823,7 @@ async def order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     order["group_message_id"] = sent.message_id
     context.bot_data["orders"][order_id] = order
     context.bot_data["pending_by_client"][str(query.from_user.id)] = order_id
+    schedule_order_expiration(context, order_id, order)
     context.user_data.pop("order", None)
 
     cancel_kb = InlineKeyboardMarkup(
@@ -657,6 +837,42 @@ async def order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_tracked(order, client_message.chat_id, client_message.message_id)
 
     return ConversationHandler.END
+
+
+def schedule_order_expiration(context: ContextTypes.DEFAULT_TYPE, order_id: str, order: dict) -> None:
+    expires_dt = parse_iso_dt(order.get("expires_at", ""))
+    if not expires_dt:
+        return
+    delay = max(1, int((expires_dt - now_moscow()).total_seconds()))
+    task = asyncio.create_task(expire_order_later(context.application, order_id, delay))
+    order["expiration_task_created"] = True
+
+
+async def expire_order_later(application, order_id: str, delay: int) -> None:
+    await asyncio.sleep(delay)
+    context_data = application.bot_data
+    order = context_data.get("orders", {}).get(order_id)
+    if not order or order.get("status") != "open":
+        return
+
+    order["status"] = "expired"
+    try:
+        await application.bot.delete_message(ORDERS_CHAT_ID, order["group_message_id"])
+    except TelegramError:
+        logger.info("Не удалось удалить просроченный заказ %s из группы", order_id)
+
+    context_data.get("pending_by_client", {}).pop(str(order.get("client_id")), None)
+    context_data.get("orders", {}).pop(order_id, None)
+
+    try:
+        await application.bot.send_message(
+            order["client_id"],
+            f"⏱ Заказ №{order_id} удалён из группы: водитель не взял его до {order.get('expires_at_display', 'истечения времени')}.\n"
+            "Можно создать новый заказ.",
+            reply_markup=MAIN_KB,
+        )
+    except TelegramError:
+        logger.info("Не удалось уведомить клиента о просрочке заказа %s", order_id)
 
 
 async def cancel_open_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1192,6 +1408,7 @@ async def take_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finish_kb = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📍 Я на месте", callback_data=f"arrived_{order_id}")],
+            [InlineKeyboardButton("▶️ Начать поездку", callback_data=f"starttrip_{order_id}")],
             [InlineKeyboardButton("✅ Завершить заказ", callback_data=f"finish_{order_id}")],
         ]
     )
@@ -1360,6 +1577,53 @@ async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_tracked(order, error_message.chat_id, error_message.message_id)
 
 
+async def start_trip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_storage(context)
+    query = update.callback_query
+    order_id = query.data.removeprefix("starttrip_")
+    order = context.bot_data["orders"].get(order_id)
+
+    if not order:
+        await query.answer("Заказ уже закрыт.", show_alert=True)
+        return
+    if query.from_user.id != order.get("driver_id"):
+        await query.answer("Начать поездку может только назначенный водитель.", show_alert=True)
+        return
+    if order.get("status") != "taken":
+        await query.answer("Заказ уже не активен.", show_alert=True)
+        return
+    if order.get("started_at"):
+        await query.answer("Поездка уже начата.", show_alert=True)
+        return
+
+    order["started_at"] = now_iso()
+    order["started_at_display"] = format_dt(now_moscow())
+    await query.answer("Клиенту отправлено: поездка началась ✅", show_alert=True)
+
+    finish_only_kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ Завершить заказ", callback_data=f"finish_{order_id}")]]
+    )
+    try:
+        await query.edit_message_text(
+            driver_private_order_text(order_id, order),
+            parse_mode="HTML",
+            reply_markup=finish_only_kb,
+            disable_web_page_preview=False,
+        )
+    except TelegramError:
+        logger.exception("Не удалось обновить карточку начала поездки %s", order_id)
+
+    try:
+        msg = await context.bot.send_message(
+            order["client_id"],
+            f"▶️ Поездка по заказу №{order_id} началась.\n"
+            f"Время начала: {order['started_at_display']}",
+        )
+        add_tracked(order, msg.chat_id, msg.message_id)
+    except TelegramError:
+        logger.exception("Не удалось уведомить клиента о начале поездки %s", order_id)
+
+
 async def arrived_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_storage(context)
     query = update.callback_query
@@ -1388,7 +1652,10 @@ async def arrived_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer("Клиенту отправлено: водитель на месте ✅", show_alert=True)
 
     finish_only_kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✅ Завершить заказ", callback_data=f"finish_{order_id}")]]
+        [
+            [InlineKeyboardButton("▶️ Начать поездку", callback_data=f"starttrip_{order_id}")],
+            [InlineKeyboardButton("✅ Завершить заказ", callback_data=f"finish_{order_id}")],
+        ]
     )
 
     try:
@@ -1430,6 +1697,7 @@ async def finish_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer("Заказ завершён")
     order["status"] = "completed"
     order["completed_at"] = now_iso()
+    order["completed_at_display"] = format_dt(now_moscow())
 
     # Удаляем сообщения заказа и переписки в обоих личных чатах.
     tracked = list(dict.fromkeys(tuple(item) for item in order.get("tracked_messages", [])))
@@ -1453,7 +1721,9 @@ async def finish_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             client_id,
-            "✅ Заказ завершён. Связь с водителем закрыта.",
+            "✅ Заказ завершён. Связь с водителем закрыта.\n"
+            f"Начало: {order.get('started_at_display', '—')}\n"
+            f"Окончание: {order.get('completed_at_display', '—')}",
             reply_markup=MAIN_KB,
         )
     except TelegramError:
@@ -1462,7 +1732,9 @@ async def finish_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             driver_id,
-            "✅ Заказ завершён. Связь с клиентом закрыта.",
+            "✅ Заказ завершён. Связь с клиентом закрыта.\n"
+            f"Начало: {order.get('started_at_display', '—')}\n"
+            f"Окончание: {order.get('completed_at_display', '—')}",
             reply_markup=MAIN_KB,
         )
     except TelegramError:
@@ -1473,6 +1745,18 @@ async def finish_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Необработанное исключение", exc_info=context.error)
+
+
+async def post_init(application: Application) -> None:
+    """После перезапуска Railway заново ставит таймеры удаления открытых заказов."""
+    for order_id, order in list(application.bot_data.get("orders", {}).items()):
+        if order.get("status") != "open":
+            continue
+        expires_dt = parse_iso_dt(order.get("expires_at", ""))
+        if not expires_dt:
+            continue
+        delay = max(1, int((expires_dt - now_moscow()).total_seconds()))
+        asyncio.create_task(expire_order_later(application, order_id, delay))
 
 
 def main():
@@ -1489,6 +1773,7 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .persistence(persistence)
+        .post_init(post_init)
         .concurrent_updates(False)
         .build()
     )
@@ -1514,6 +1799,8 @@ def main():
             ],
             ORDER_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_time)],
             ORDER_CLASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_class)],
+            ORDER_TARIFF: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_tariff)],
+            ORDER_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_price)],
             ORDER_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_comment)],
             ORDER_CONFIRM: [
                 CallbackQueryHandler(order_confirm, pattern=r"^order_(send|cancel)$")
@@ -1567,6 +1854,7 @@ def main():
     app.add_handler(CallbackQueryHandler(moderate_driver, pattern=r"^(approve|reject)_[A-F0-9]{8}$"))
     app.add_handler(CallbackQueryHandler(take_order, pattern=r"^take_[A-F0-9]{8}$"))
     app.add_handler(CallbackQueryHandler(arrived_order, pattern=r"^arrived_[A-F0-9]{8}$"))
+    app.add_handler(CallbackQueryHandler(start_trip, pattern=r"^starttrip_[A-F0-9]{8}$"))
     app.add_handler(CallbackQueryHandler(request_car_photo, pattern=r"^request_photo_[A-F0-9]{8}$"))
     app.add_handler(CallbackQueryHandler(finish_order, pattern=r"^finish_[A-F0-9]{8}$"))
 
