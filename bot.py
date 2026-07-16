@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+from ai.dispatcher import get_welcome_message
+
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -452,7 +454,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.effective_message.reply_text(
-        "🚖 VIP Taxi\n\nВыберите действие:",
+        get_welcome_message(),
         reply_markup=MAIN_KB,
     )
 
