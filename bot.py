@@ -6,6 +6,9 @@ import logging
 import os
 import re
 import uuid
+from dotenv import load_dotenv
+
+load_dotenv()
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
